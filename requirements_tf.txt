@@ -7,7 +7,13 @@ tqdm
 # numerically wrong gradients for this model (see train_tf.py's
 # set_visible_devices([], "GPU") comment) -- training is CPU-only for now.
 
-# Raspberry Pi (inference only) — install ONE of these instead of tensorflow:
-#   pip install tflite-runtime         # if a wheel exists for your Pi's OS/Python
-#   pip install ai-edge-litert         # newer replacement for tflite-runtime
-# Then in run_tflite_mac.py, swap the "Mac" import block for the "Raspberry Pi" one.
+# Raspberry Pi (inference only) — use run_tflite_pi.py, NOT run_tflite_mac.py.
+# It's a separate, self-contained script (own NumPy mel-spectrogram
+# implementation matching kws_common.py's TF-side math, verified numerically)
+# with zero tensorflow dependency -- only:
+#   pip install ai-edge-litert numpy
+# (tflite-runtime is the older package name; confirmed no wheel available for
+# several current platform/Python combos, ai-edge-litert is Google's actively
+# maintained replacement and what this script defaults to -- swap the import
+# block at the top of run_tflite_pi.py if your device already has
+# tflite-runtime specifically and you'd rather not switch)

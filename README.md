@@ -10,6 +10,7 @@ A decoder-only Transformer keyword spotter, trained and statically (int8) quanti
 | [train_tf.py](train_tf.py) | Trains the model (custom loop mirroring the PyTorch script: OneCycle LR, grad clipping, label smoothing, best-val checkpointing). |
 | [convert_to_tflite.py](convert_to_tflite.py) | Post-training **static** (full-integer) quantization to `.tflite`, calibrated on real validation-set spectrograms. |
 | [run_tflite_mac.py](run_tflite_mac.py) | Runs the quantized model on Mac — full validation sweep (accuracy + latency) or a single WAV smoke test — before touching the Pi. |
+| [run_tflite_pi.py](run_tflite_pi.py) | **Standalone** Raspberry Pi inference script — only `ai-edge-litert` (or `tflite-runtime`) + `numpy`, no `tensorflow`. Has its own NumPy mel-spectrogram implementation matching `kws_common.py`'s TF-side math specifically (verified to match its real output — see [Notes](#notes)); this is *not* the same math `run_onnx_pi.py` uses. |
 
 ### PyTorch → ONNX
 
@@ -147,11 +148,16 @@ uv run python run_tflite_mac.py --num-samples 500      # faster partial sweep
 uv run python run_tflite_mac.py --wav some_clip.wav    # single-file smoke test: top-5 predictions
 ```
 
-The full sweep reports overall accuracy plus average and p95 per-sample latency — this is the check to run before trusting the model on-device. Only once this looks right should you copy `keyword_spotting_int8.tflite` (plus `run_tflite_mac.py`/`kws_common.py` for the preprocessing code) over to the Raspberry Pi.
+The full sweep reports overall accuracy plus average and p95 per-sample latency — this is the check to run before trusting the model on-device.
 
 ### 5. Deploy to Raspberry Pi
 
-In `run_tflite_mac.py`, swap the "Mac" import block for the "Raspberry Pi" block (both are present, one commented out) — the `Interpreter.allocate_tensors/set_tensor/invoke/get_tensor` API is identical either way, so no other code changes are needed. On the Pi, install `tflite-runtime` or `ai-edge-litert` instead of full `tensorflow` (see [requirements_tf.txt](requirements_tf.txt)) — the converted model uses only built-in TFLite ops (no Flex/Select-TF ops), so the lightweight runtime is sufficient.
+```bash
+pip install ai-edge-litert numpy   # on the Pi — no tensorflow needed
+python run_tflite_pi.py --wav some_clip.wav
+```
+
+Copy `keyword_spotting_int8.tflite` and **`run_tflite_pi.py`** (not `run_tflite_mac.py`) to the Pi — it's a separate, self-contained script with its own NumPy log-mel implementation and zero `tensorflow` dependency (verified in isolation, see [Notes](#notes)). The converted model uses only built-in TFLite ops (no Flex/Select-TF ops), so the lightweight runtime is sufficient — and it already tries a Coral Edge TPU / DSP / GPU delegate before falling back to CPU (see [Delegation](#delegation-dsp--gpu--cpu-fallback)).
 
 ## PyTorch → ONNX: how to run
 
@@ -378,6 +384,8 @@ def load_delegates():
 
 **A genuinely useful finding, not just a mechanism check**: on ONNX, the *default* outcome on this Mac is now `CoreMLExecutionProvider`, not CPU — and it's **slower**, not faster: ~7.74ms/sample vs. the ~1.3ms `CPUExecutionProvider`-only baseline measured earlier in this document. Why: CoreML only claimed 50 of the graph's 562 nodes (`CoreMLExecutionProvider::GetCapability` logs this directly), so most of the computation still runs on CPU regardless — and the overhead of partitioning the graph and marshaling tensors across the CoreML/CPU boundary for those 50 nodes outweighs any compute speedup for a model this small and already this fast. This is a real, known characteristic of accelerator delegation, not a bug: small, quantized, already-fast models are exactly the case where "try the accelerator first" can backfire. The priority order here is deliberately still DSP→GPU→CPU as asked (a fixed, standard delegation chain), not an adaptive "benchmark and pick the fastest" scheme — if raw latency matters more than following that convention, pass `providers=["CPUExecutionProvider"]` directly to skip CoreML.
 
+`run_tflite_pi.py` uses the identical `load_delegates()` pattern (same code, verified the same way — see its Notes entry below), with one addition: a **Coral Edge TPU** candidate (`libedgetpu.so.1`) ahead of DSP/GPU, since a USB/PCIe Coral accelerator is the realistic real-world TFLite+Raspberry-Pi accelerator story, unlike a Hexagon DSP or a mobile GPU delegate.
+
 ## Notes
 
 ### TensorFlow → TFLite
@@ -386,6 +394,7 @@ def load_delegates():
 - **Dataset reuse**: the TF loader downloads to `./data/SpeechCommands/speech_commands_v0.02/`, the same layout torchaudio uses — if you already ran the PyTorch script against `./data`, this reuses it instead of re-downloading ~2.4 GB.
 - **Frame count**: the log-mel pipeline reflect-pads by `N_FFT//2` before framing so a 1 s clip always yields exactly `MAX_FRAMES=101` frames, matching torchaudio's `center=True` behavior. The window is `N_FFT`-length Hann rather than a zero-padded `WIN_LENGTH` window inside `N_FFT` (torch's exact approach) — numerically slightly different, functionally equivalent; not worth chasing bit-exactness for a from-scratch TF training run.
 - **Verified locally** (this session, TF 2.21 on Apple Silicon): model builds and traces correctly, mel spectrogram yields shape `(101, 80)`, static int8 conversion succeeds using **only built-in TFLite ops** (`FULLY_CONNECTED`, `BATCH_MATMUL`, `SOFTMAX`, `GELU`, `MEAN`, …) — no Flex/Select-TF ops, no custom ops — so the same `.tflite` file will load with lightweight `tflite_runtime`/`ai-edge-litert` on the Raspberry Pi, not just the full `tensorflow` package.
+- **`run_tflite_pi.py`'s NumPy preprocessing matches `kws_common.py` specifically, not `run_onnx_pi.py`'s torchaudio-matching math — verified, not assumed.** The two TF/ONNX pipelines deliberately use different windowing conventions (`kws_common.py`: full `N_FFT`-length Hann window; torchaudio: a shorter `WIN_LENGTH` window zero-padded/centered inside `N_FFT`), so reusing `run_onnx_pi.py`'s mel code here would have silently mismatched what this TF-trained model actually saw during training. Compared `run_tflite_pi.py`'s output directly against real `kws_common.py` output on 20 real validation clips: correlation ≥ 0.9999994, max absolute difference 0.0046 — float32 precision noise, not a preprocessing bug. Also confirmed its "zero `tensorflow` dependency" claim the same way as `run_onnx_pi.py`'s: ran it end-to-end (real quantized model, real WAV file, delegate fallback and all) in a virtualenv containing only `ai-edge-litert` + `numpy` — no `tensorflow` anywhere in `pip list`. Separately: `pip install tflite-runtime` had **no wheel at all** for this Python/platform combination (confirmed directly) — `ai-edge-litert` is Google's actively maintained replacement and installed/worked cleanly, so it's the default import in this script, with `tflite_runtime` kept as a commented fallback for devices that already have it.
 - **LayerNorm quantization islands**: a handful of tiny float32 tensors remain around each `LayerNormalization`'s mean computation (`DEQUANTIZE → NEG/MEAN → QUANTIZE`) — this is standard, expected TFLite behavior for LayerNorm (no native quantized mean-subtraction kernel), not a conversion bug, and adds negligible overhead.
 - **I/O dtype**: `convert_to_tflite.py --io-type int8` (default) gives fully integer input/output, best for microcontroller-style RPi deployment. `--io-type float32` keeps float32 in/out with int8 math internally, if you'd rather feed raw float mel arrays without manual quantization.
 - **CPU-only training, deliberately**: `train_tf.py` force-disables the GPU (`tf.config.set_visible_devices([], "GPU")`) and the project does not depend on `tensorflow-metal`. Apple's Metal GPU PluggableDevice was tried first (it does run, ~2.9x faster per step) but was found to compute numerically **wrong** gradients for this model: with the identical forward pass and the same random init, CPU gives a normal global gradient norm (~2.5) while Metal gives ~1e5–1e6, with some individual weight-gradient norms in the *billions* — inconsistent with the (small, correct) activation gradients feeding them by many orders of magnitude, which is not "instability," it's an incorrect backward pass. That corruption is exactly what caused the `loss nan` / `acc 0.0000` you'd see a few epochs in. Revisit GPU once Apple ships a `tensorflow-metal` fix for this op combination (batched multi-head attention + causal masking + LayerNorm is the likely culprit, though the exact faulty op wasn't isolated further).
