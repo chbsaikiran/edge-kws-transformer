@@ -24,3 +24,4 @@ checkpoints_tf/
 # Converted TFLite / ONNX models
 *.tflite
 *.onnx
+*.data
