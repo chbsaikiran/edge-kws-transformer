@@ -214,7 +214,17 @@ class CausalSelfAttention(layers.Layer):
         self.qkv = layers.Dense(3 * d_model, use_bias=True, kernel_initializer=_TRUNC_NORMAL)
         self.out_proj = layers.Dense(d_model, use_bias=True, kernel_initializer=_TRUNC_NORMAL)
         self.attn_drop = layers.Dropout(dropout)
-        causal = np.triu(np.full((seq_len, seq_len), -1e4, dtype=np.float32), k=1)
+        # Mask magnitude matters for int8 static quantization even though it's a
+        # no-op for float32: the ADD op combining this mask with the real attention
+        # logits gets a SINGLE int8 quantization range spanning both. With -1e4,
+        # that range is ~[-1e4, +27] -- ~39 units/level, i.e. the real logit spread
+        # (empirically ~[-27, +27] on the trained model) collapses into roughly one
+        # quantization level, destroying attention resolution (confirmed: this
+        # alone took validation accuracy from 0.95 float32 to 0.26 int8). -100 is
+        # still >>3x past the observed logit extremes (still ~0 softmax weight for
+        # masked positions) while keeping the ADD's int8 range tight (~[-127, +27],
+        # ~0.6 units/level -- roughly 65x better precision).
+        causal = np.triu(np.full((seq_len, seq_len), -100.0, dtype=np.float32), k=1)
         self.causal_bias = tf.constant(causal[np.newaxis, np.newaxis, :, :])  # [1,1,T,T]
 
     def call(self, x, training=False):

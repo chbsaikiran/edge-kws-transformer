@@ -231,8 +231,16 @@ class CausalSelfAttention(nn.Module):
         q, k, v = qkv.unbind(0)               # each [B, H, T, D]
 
         attn = (q @ k.transpose(-2, -1)) / self.scale   # [B, H, T, T]
+        # Mask magnitude matters for int8 static quantization even though it's a
+        # no-op for float32: the ADD combining this mask with the real attention
+        # logits gets a single int8 range spanning both. -1e4 forces that range to
+        # ~[-1e4, +27] (~39 units/quantization level on the TF side, empirically
+        # confirmed to collapse validation accuracy from 0.95 to 0.26) -- i.e. the
+        # real logit spread (~[-27, +27] on the trained model) is destroyed. -100
+        # is still >>3x past the observed logit extremes (~0 softmax weight for
+        # masked positions) while keeping the ADD's int8 range tight.
         causal = torch.triu(
-            torch.full((T, T), -1e4, device=x.device), diagonal=1
+            torch.full((T, T), -100.0, device=x.device), diagonal=1
         )
         attn = attn + causal
         attn = F.softmax(attn, dim=-1)
