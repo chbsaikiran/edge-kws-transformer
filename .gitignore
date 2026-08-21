@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Dataset (downloaded by train.py / train_tf.py, ~2.4 GB)
+data/
+
+# Model checkpoints
+checkpoints/
+checkpoints_tf/
+*.pt
+*.weights.h5
+
+# Converted TFLite models
+*.tflite
