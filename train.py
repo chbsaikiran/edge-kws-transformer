@@ -29,10 +29,13 @@ def train():
     val_ds   = SpeechCommandsDataset(kws.DATA_ROOT, "validation", augment=False)
     print(f"  Train: {len(train_ds):,}  |  Val: {len(val_ds):,}")
 
+    # pin_memory only helps (and is only supported) for CUDA host->device
+    # copies; it's a no-op/irrelevant for MPS and CPU.
+    pin_memory = kws.DEVICE == "cuda"
     train_dl = DataLoader(train_ds, kws.BATCH_SIZE, shuffle=True,
-                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=2, collate_fn=collate_fn, pin_memory=pin_memory)
     val_dl   = DataLoader(val_ds, kws.BATCH_SIZE, shuffle=False,
-                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=2, collate_fn=collate_fn, pin_memory=pin_memory)
 
     model = KeywordSpottingTransformer().to(kws.DEVICE)
     n_params = sum(p.numel() for p in model.parameters())

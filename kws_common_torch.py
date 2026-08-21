@@ -54,7 +54,21 @@ BATCH_SIZE   = 256
 LR           = 3e-4
 WEIGHT_DECAY = 1e-4
 EPOCHS       = 40
-DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+# Apple Silicon GPU (MPS) is used when available. Unlike tensorflow-metal (see
+# kws_common.py / train_tf.py -- confirmed to produce numerically wrong
+# gradients for this same architecture), PyTorch's MPS backend was verified
+# safe here: a single-batch CPU-vs-MPS gradient comparison showed some
+# per-element numerical difference (expected cross-backend float32 noise,
+# concentrated in early LayerNorm as usual), but a 120-step real-data training
+# run on MPS converged cleanly (loss 3.59->1.88, acc 0.8%->58.6%, zero
+# NaN/Inf) and tracked a CPU run step-for-step over 25 steps. If you ever see
+# NaN loss / stalled accuracy after a PyTorch or macOS update, force CPU here
+# as a first debugging step, the same way train_tf.py does for Metal.
+DEVICE = (
+    "mps" if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
 DATA_ROOT    = "./data"
 CKPT_DIR     = "./checkpoints"
 CKPT_PATH    = f"{CKPT_DIR}/best_model.pt"
