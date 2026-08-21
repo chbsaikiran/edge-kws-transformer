@@ -208,6 +208,135 @@ python run_onnx_pi.py --wav some_clip.wav
 
 Copy `keyword_spotting_int8.onnx` and **`run_onnx_pi.py`** (not `run_onnx_mac.py`) to the Pi — it's a separate, self-contained script with its own NumPy log-mel implementation and zero torch/torchaudio dependency (verified in isolation, see [Notes](#notes)). The inference call itself (`onnxruntime.InferenceSession` + `.run(...)`) is identical to what runs on Mac; only the preprocessing path differs.
 
+## Quantized model I/O: why TFLite's boundary is int8 and ONNX's is float32
+
+Run both verification scripts and the printed I/O dtypes differ:
+
+```
+$ uv run python run_tflite_mac.py
+Input : [1, 101, 80] <class 'numpy.int8'> quant(scale,zp)= (0.03343628719449043, -26)
+
+$ uv run python run_onnx_mac.py
+Input : mel_input [1, 101, 80] tensor(float)
+```
+
+This is **not** a difference between what TFLite and ONNX Runtime are *capable* of — it's a difference between the conversion flags this repo happens to use for each. Both formats support both boundary types; the sections below explain the actual mechanism in each, then exactly what changes to switch each one to the other. Every claim and code snippet below was run against the real files in this repo, not written from memory.
+
+### 1. TFLite: the converter can strip or keep the boundary Q/DQ ops
+
+`convert_to_tflite.py` calls `TFLiteConverter.convert()` with full-graph int8 calibration active either way (`converter.optimizations = [tf.lite.Optimize.DEFAULT]`, `target_spec.supported_ops = [TFLITE_BUILTINS_INT8]`). What changes I/O dtype is two extra lines, gated on `--io-type`:
+
+```python
+# convert_to_tflite.py
+if args.io_type == "int8":
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+```
+
+Internally, the converter *always* computes where a boundary `Quantize`/`Dequantize` pair would go (using the representative-dataset calibration, same as every other op). `inference_input_type`/`inference_output_type` decide what happens to that pair:
+- **Left at the default (`tf.float32`)**: the boundary `Quantize`/`Dequantize` ops are kept as real ops inside the flatbuffer graph. The model accepts/returns float32, and quantization happens as the first/last thing the graph itself does.
+- **Set to `tf.int8`**: the converter *removes* those boundary ops and exposes their `(scale, zero_point)` as tensor metadata instead — retrievable via `interpreter.get_input_details()[0]['quantization']`. The graph's first real op now consumes int8 directly; nothing inside the flatbuffer does the float→int8 conversion, because the boundary op that used to do it was deleted.
+
+That's why `int8` mode needs caller-side code and `float32` mode wouldn't: `run_tflite_mac.py`'s `quantize()`/`dequantize()` functions are reimplementing, in Python, exactly the op the converter stripped out of the graph:
+
+```python
+# run_tflite_mac.py
+def quantize(x_float, quant_params, dtype):
+    scale, zero_point = quant_params
+    if dtype in (np.int8, np.uint8) and scale != 0:
+        q = np.round(x_float / scale + zero_point)
+        info = np.iinfo(dtype)
+        q = np.clip(q, info.min, info.max)
+        return q.astype(dtype)
+    return x_float.astype(dtype)   # already float32 -- no-op
+```
+i.e. standard affine/asymmetric quantization: `q = clip(round(x/scale + zero_point), -128, 127)`, `x = (q - zero_point) * scale`.
+
+### 2. ONNX Runtime (QDQ format): the Q/DQ ops always live *inside* the graph
+
+`convert_to_onnx.py` calls `quantize_static(..., quant_format=QuantFormat.QDQ, ...)`. Critically, **`quant_format` controls internal op representation, not the graph's external I/O dtype** — there is no ORT equivalent of `inference_input_type`. `graph.input`/`graph.output` keep whatever dtype `torch.onnx.export` gave them (float32), regardless of `QuantFormat.QDQ` vs `QuantFormat.QOperator`.
+
+Tracing the real exported graph (`onnx.load("keyword_spotting_int8.onnx")`, following node producers/consumers from `mel_input`) shows exactly what QDQ actually inserted:
+
+```
+mel_input (FLOAT)
+  --[Reshape "gemm_input_reshape"]-->  gemm_input_reshape_arg
+  --[QuantizeLinear "gemm_input_reshape_arg_QuantizeLinear"]-->  ..._QuantizeLinear_Output   (INT8)
+  --[DequantizeLinear "gemm_input_reshape_arg_DequantizeLinear"]-->  ..._DequantizeLinear_Output  (FLOAT)
+  --[Gemm "node_MatMul_1/MatMulAddFusion"]-->  ...   (input_proj Linear layer)
+```
+with the real calibrated parameters: `gemm_input_reshape_arg_scale = 0.033006`, `gemm_input_reshape_arg_zero_point = -29` (int8). Symmetrically, the graph's *last* op is a `DequantizeLinear` (`logits_DequantizeLinear`, `scale=0.034553`, `zero_point=-63`) converting the int8-computed logits back to the float32 `logits` output.
+
+Per the ONNX spec, `QuantizeLinear` computes `y = saturate(round(x / y_scale) + y_zero_point)` and `DequantizeLinear` computes `y = (x - x_zero_point) * x_scale` — the same affine scheme as TFLite, just expressed as graph nodes instead of tensor metadata. (One real subtlety if you're chasing bit-exactness: ONNX's `QuantizeLinear` rounds half-to-even per spec; TFLite's rounding-tie behavior isn't guaranteed identical. Doesn't matter for accuracy at these scales, but worth knowing before assuming int8 quantized values are portable byte-for-byte between the two.)
+
+This is also *why* `run_onnx_mac.py`/`run_onnx_pi.py` have no `quantize()`/`dequantize()` functions at all: that logic isn't missing, it's just living inside the graph as `QuantizeLinear`/`DequantizeLinear` nodes that execute automatically on every `session.run()`, instead of as Python code the caller has to invoke. Separately: the *on-disk* graph shape above (Reshape→Quantize→Dequantize→Gemm, i.e. the Gemm still nominally runs on dequantized float32 values) is what QDQ format always looks like as saved — ONNX Runtime's graph optimizer is free to fuse `Quantize→Op→Dequantize` patterns into genuine int8 kernels at session-load time for whichever execution provider is active (this is very likely why the measured latency was ~1.3ms — much faster than a real all-float32 forward pass at this size would be), but that fusion is a runtime decision, not something reflected in the saved `.onnx` file itself.
+
+### 3. Making TFLite accept float32 input instead of int8
+
+Already fully implemented — no code changes needed, just a flag:
+
+```bash
+uv run python convert_to_tflite.py --io-type float32
+```
+
+This skips the `converter.inference_input_type = tf.int8` / `inference_output_type = tf.int8` lines, so both stay at the converter's default (`tf.float32`), which keeps the boundary `Quantize`/`Dequantize` ops inside the graph — structurally the same shape as the ONNX QDQ graph in §2.
+
+`run_tflite_mac.py` doesn't need touching either: its `quantize()`/`dequantize()` functions already branch on `in_det["dtype"]` — for a `float32`-I/O model that branch is false, so they fall through to `.astype(dtype)` (a no-op cast) and pass the array straight through. The same script already handles both `--io-type` variants transparently; this was true before this section was written, just not exercised or documented until now.
+
+### 4. Making ONNX accept int8 input instead of float32
+
+Unlike TFLite, **`onnxruntime.quantization` has no built-in flag for this** — `quant_format=QuantFormat.QOperator` changes how ops get fused/named internally, but neither `QOperator` nor `QDQ` ever touches `graph.input`/`graph.output`'s declared dtype. Getting genuine int8 boundary I/O requires manual graph surgery on the already-quantized `.onnx` file: delete the boundary `QuantizeLinear`/`DequantizeLinear` nodes, rewire their neighbors, and change the graph's declared input/output element type. This is not officially documented/supported by ONNX Runtime's quantization tools, so treat it as a recipe, not an API — the following was written against this repo's actual `keyword_spotting_int8.onnx` and verified (below), but it depends on the specific node names ORT's quantizer happened to generate.
+
+```python
+import onnx
+from onnx import TensorProto, numpy_helper, shape_inference
+
+model = onnx.load("keyword_spotting_int8.onnx")
+graph = model.graph
+init_by_name = {i.name: i for i in graph.initializer}
+
+def get_scale_zp(node):
+    scale = float(numpy_helper.to_array(init_by_name[node.input[1]]))
+    zero_point = int(numpy_helper.to_array(init_by_name[node.input[2]]))
+    return scale, zero_point
+
+# --- Input side: delete the QuantizeLinear right after mel_input's Reshape,
+#     rewire its consumers to read its (now-int8) input tensor directly, and
+#     declare the graph input itself as int8.
+q_node = next(n for n in graph.node if n.name == "gemm_input_reshape_arg_QuantizeLinear")
+in_scale, in_zero_point = get_scale_zp(q_node)
+produced, consumed = q_node.output[0], q_node.input[0]
+for n in graph.node:
+    n.input[:] = [consumed if x == produced else x for x in n.input]
+graph.node.remove(q_node)
+graph.input[0].type.tensor_type.elem_type = TensorProto.INT8
+
+# --- Output side: delete the final DequantizeLinear, and make the graph's
+#     declared output the (int8) tensor that used to feed it.
+dq_node = next(n for n in graph.node if n.name == "logits_DequantizeLinear")
+out_scale, out_zero_point = get_scale_zp(dq_node)
+graph.output[0].name = dq_node.input[0]
+graph.node.remove(dq_node)
+graph.output[0].type.tensor_type.elem_type = TensorProto.INT8
+
+# The intermediate value_info entries between the old boundary ops and the
+# rest of the graph still declare float32 from before this edit -- onnx's
+# checker doesn't catch the resulting mismatch, but ONNX Runtime's loader
+# does (confirmed: "Type Error: Type (tensor(float)) of output arg ... does
+# not match expected type (tensor(int8))" without this). Clear and recompute.
+del graph.value_info[:]
+model = shape_inference.infer_shapes(model)
+
+onnx.checker.check_model(model)
+onnx.save(model, "keyword_spotting_int8_intio.onnx")
+print(f"input:  scale={in_scale}  zero_point={in_zero_point}")
+print(f"output: scale={out_scale}  zero_point={out_zero_point}")
+```
+
+**Verified, not just written**: ran this against the real `keyword_spotting_int8.onnx`, loaded the result in `onnxruntime.InferenceSession` (confirmed `input: mel_input [1,101,80] tensor(int8)`, `output: [1,35] tensor(int8)`), and compared predictions against the original float-I/O model on 20 real validation clips using the printed `in_scale`/`in_zero_point`/`out_scale`/`out_zero_point` to manually quantize/dequantize (i.e. `run_tflite_mac.py`'s `quantize()`/`dequantize()` functions, reused as-is) — **20/20 matched**. The first attempt (without the `value_info` clear + `shape_inference.infer_shapes()` step) passed `onnx.checker.check_model()` but failed to load in `onnxruntime.InferenceSession` with the type-mismatch error quoted in the comment above — a real gap between what the ONNX checker validates and what the ORT loader requires, worth knowing if you extend this.
+
+To actually use an int8-I/O ONNX model, `run_onnx_mac.py`/`run_onnx_pi.py` would need their own `quantize()`/`dequantize()` functions added (the same two functions already in `run_tflite_mac.py` would work verbatim, since both formats use the identical affine int8 scheme) — not done in this repo since QDQ's float-I/O + internal fusion already gets the same ~1.3ms latency without that extra caller-side bookkeeping.
+
 ## Notes
 
 ### TensorFlow → TFLite
