@@ -21,15 +21,48 @@ import time
 
 import numpy as np
 
-# --- Mac (this script): use tf.lite.Interpreter from the full tensorflow package.
+# --- Mac (this script): use tf.lite.Interpreter/load_delegate from the full tensorflow package.
 import tensorflow as tf
 Interpreter = tf.lite.Interpreter
-# --- Raspberry Pi: comment the two lines above and uncomment ONE of these:
+load_delegate = tf.lite.experimental.load_delegate
+# --- Raspberry Pi: comment the three lines above and uncomment ONE of these:
 # import tflite_runtime.interpreter as tflite
 # Interpreter = tflite.Interpreter
-# from ai_edge_litert.interpreter import Interpreter
+# load_delegate = tflite.load_delegate
+# from ai_edge_litert.interpreter import Interpreter, load_delegate
 
 import kws_common as kws
+
+# Delegation priority: DSP -> GPU -> CPU. Unlike ONNX Runtime's
+# `providers=[...]` (a list ORT tries in order, silently skipping whatever
+# isn't compiled into the installed package), TFLite's Python API has no
+# built-in fallback chain -- each delegate's shared library has to be
+# attempted and caught individually, one at a time. Confirmed on this Mac:
+# both .so files below genuinely don't exist here (they're built for
+# Android/embedded targets, not bundled with the `tensorflow` pip package for
+# macOS) -- dlopen raises a clean, catchable OSError for each, so this always
+# falls through to CPU (XNNPACK, TFLite's default) on Mac. The code is
+# structured to actually pick up a real GPU/DSP delegate on a device that
+# ships one (e.g. an Android build with libtensorflowlite_gpu_delegate.so, or
+# a Qualcomm board with libhexagon_delegate.so on the library path).
+_DELEGATE_CANDIDATES = [
+    ("DSP (Hexagon)", "libhexagon_delegate.so", {}),
+    ("GPU", "libtensorflowlite_gpu_delegate.so", {}),
+]
+
+
+def load_delegates():
+    """Try DSP, then GPU, returning the first that loads. Falls back to no
+    explicit delegate (TFLite's default XNNPACK CPU path) if neither does."""
+    for name, lib, options in _DELEGATE_CANDIDATES:
+        try:
+            delegate = load_delegate(lib, options)
+            print(f"Delegate: {name} ({lib})")
+            return [delegate], name
+        except (ValueError, OSError) as e:
+            print(f"Delegate unavailable: {name} ({lib}) -- {e.__class__.__name__}")
+    print("Delegate: CPU (XNNPACK, default -- no GPU/DSP delegate available)")
+    return [], "CPU"
 
 
 def quantize(x_float, quant_params, dtype):
@@ -50,7 +83,8 @@ def dequantize(x_q, quant_params, dtype):
 
 
 def load_interpreter(tflite_path):
-    interp = Interpreter(model_path=tflite_path)
+    delegates, active = load_delegates()
+    interp = Interpreter(model_path=tflite_path, experimental_delegates=delegates)
     interp.allocate_tensors()
     in_det = interp.get_input_details()[0]
     out_det = interp.get_output_details()[0]

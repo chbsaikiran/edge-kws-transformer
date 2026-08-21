@@ -269,7 +269,7 @@ with the real calibrated parameters: `gemm_input_reshape_arg_scale = 0.033006`, 
 
 Per the ONNX spec, `QuantizeLinear` computes `y = saturate(round(x / y_scale) + y_zero_point)` and `DequantizeLinear` computes `y = (x - x_zero_point) * x_scale` — the same affine scheme as TFLite, just expressed as graph nodes instead of tensor metadata. (One real subtlety if you're chasing bit-exactness: ONNX's `QuantizeLinear` rounds half-to-even per spec; TFLite's rounding-tie behavior isn't guaranteed identical. Doesn't matter for accuracy at these scales, but worth knowing before assuming int8 quantized values are portable byte-for-byte between the two.)
 
-This is also *why* `run_onnx_mac.py`/`run_onnx_pi.py` have no `quantize()`/`dequantize()` functions at all: that logic isn't missing, it's just living inside the graph as `QuantizeLinear`/`DequantizeLinear` nodes that execute automatically on every `session.run()`, instead of as Python code the caller has to invoke. Separately: the *on-disk* graph shape above (Reshape→Quantize→Dequantize→Gemm, i.e. the Gemm still nominally runs on dequantized float32 values) is what QDQ format always looks like as saved — ONNX Runtime's graph optimizer is free to fuse `Quantize→Op→Dequantize` patterns into genuine int8 kernels at session-load time for whichever execution provider is active (this is very likely why the measured latency was ~1.3ms — much faster than a real all-float32 forward pass at this size would be), but that fusion is a runtime decision, not something reflected in the saved `.onnx` file itself.
+This is also *why* `run_onnx_mac.py`/`run_onnx_pi.py` have no `quantize()`/`dequantize()` functions at all: that logic isn't missing, it's just living inside the graph as `QuantizeLinear`/`DequantizeLinear` nodes that execute automatically on every `session.run()`, instead of as Python code the caller has to invoke. Separately: the *on-disk* graph shape above (Reshape→Quantize→Dequantize→Gemm, i.e. the Gemm still nominally runs on dequantized float32 values) is what QDQ format always looks like as saved — ONNX Runtime's graph optimizer is free to fuse `Quantize→Op→Dequantize` patterns into genuine int8 kernels at session-load time for whichever execution provider is active, but that fusion is a runtime decision, not something reflected in the saved `.onnx` file itself. (Measured on `CPUExecutionProvider` specifically: ~1.3ms/sample, much faster than a real all-float32 forward pass at this size would be — a real, execution-provider-dependent number, not a property of the file. See the delegation note below for how that changes under `CoreMLExecutionProvider`.)
 
 ### 3. Making TFLite accept float32 input instead of int8
 
@@ -335,7 +335,48 @@ print(f"output: scale={out_scale}  zero_point={out_zero_point}")
 
 **Verified, not just written**: ran this against the real `keyword_spotting_int8.onnx`, loaded the result in `onnxruntime.InferenceSession` (confirmed `input: mel_input [1,101,80] tensor(int8)`, `output: [1,35] tensor(int8)`), and compared predictions against the original float-I/O model on 20 real validation clips using the printed `in_scale`/`in_zero_point`/`out_scale`/`out_zero_point` to manually quantize/dequantize (i.e. `run_tflite_mac.py`'s `quantize()`/`dequantize()` functions, reused as-is) — **20/20 matched**. The first attempt (without the `value_info` clear + `shape_inference.infer_shapes()` step) passed `onnx.checker.check_model()` but failed to load in `onnxruntime.InferenceSession` with the type-mismatch error quoted in the comment above — a real gap between what the ONNX checker validates and what the ORT loader requires, worth knowing if you extend this.
 
-To actually use an int8-I/O ONNX model, `run_onnx_mac.py`/`run_onnx_pi.py` would need their own `quantize()`/`dequantize()` functions added (the same two functions already in `run_tflite_mac.py` would work verbatim, since both formats use the identical affine int8 scheme) — not done in this repo since QDQ's float-I/O + internal fusion already gets the same ~1.3ms latency without that extra caller-side bookkeeping.
+To actually use an int8-I/O ONNX model, `run_onnx_mac.py`/`run_onnx_pi.py` would need their own `quantize()`/`dequantize()` functions added (the same two functions already in `run_tflite_mac.py` would work verbatim, since both formats use the identical affine int8 scheme) — not done in this repo since QDQ's float-I/O + internal fusion already gets a fast (~1.3ms on `CPUExecutionProvider`) result without that extra caller-side bookkeeping.
+
+## Delegation: DSP → GPU → CPU fallback
+
+Both `run_onnx_mac.py` and `run_tflite_mac.py` try to run on a DSP/NPU first, then a GPU, falling back to CPU — a standard edge-deployment "delegation" pattern, since these runtimes never guarantee any given accelerator is present on the target device. The two runtimes implement this differently, and it's worth knowing which is which if you're extending either script.
+
+**ONNX Runtime does this natively.** `InferenceSession(path, providers=[...])` takes a *priority-ordered list*; ORT tries each in order and silently skips any provider that isn't compiled into the installed `onnxruntime` package — no exception, no per-provider code needed:
+
+```python
+# run_onnx_mac.py
+PROVIDER_PRIORITY = [
+    "QNNExecutionProvider",     # DSP/NPU (Qualcomm Hexagon)
+    "CoreMLExecutionProvider",  # GPU/Neural Engine (Apple Silicon)
+    "CUDAExecutionProvider",    # GPU (NVIDIA, only if onnxruntime-gpu is installed)
+    "CPUExecutionProvider",     # always available -- guaranteed fallback
+]
+available = set(ort.get_available_providers())
+providers = [p for p in PROVIDER_PRIORITY if p in available]
+sess = ort.InferenceSession(onnx_path, providers=providers)
+```
+
+**TFLite's Python API has no equivalent fallback chain** — each delegate's shared library has to be attempted and caught individually:
+
+```python
+# run_tflite_mac.py
+_DELEGATE_CANDIDATES = [
+    ("DSP (Hexagon)", "libhexagon_delegate.so", {}),
+    ("GPU", "libtensorflowlite_gpu_delegate.so", {}),
+]
+
+def load_delegates():
+    for name, lib, options in _DELEGATE_CANDIDATES:
+        try:
+            return [load_delegate(lib, options)], name
+        except (ValueError, OSError):
+            pass   # try the next candidate
+    return [], "CPU"   # TFLite's default XNNPACK path
+```
+
+**Verified on this Mac, both directions** — confirmed `ort.get_available_providers()` returns `['CoreMLExecutionProvider', 'AzureExecutionProvider', 'CPUExecutionProvider']` (no QNN — this hardware has no Qualcomm DSP, as expected), and confirmed `tf.lite.experimental.load_delegate('libtensorflowlite_gpu_delegate.so')`/`'libhexagon_delegate.so'` both raise a clean, catchable `OSError` (these .so files are Android/embedded build artifacts, not bundled with the macOS `tensorflow` pip package). Ran both full validation sweeps end to end afterward — accuracy unaffected either way (TFLite: 0.94/50 via CPU/XNNPACK fallback; ONNX: 0.96/50 via CoreML) — confirming the fallback logic doesn't silently break correctness, just which backend executes the graph.
+
+**A genuinely useful finding, not just a mechanism check**: on ONNX, the *default* outcome on this Mac is now `CoreMLExecutionProvider`, not CPU — and it's **slower**, not faster: ~7.74ms/sample vs. the ~1.3ms `CPUExecutionProvider`-only baseline measured earlier in this document. Why: CoreML only claimed 50 of the graph's 562 nodes (`CoreMLExecutionProvider::GetCapability` logs this directly), so most of the computation still runs on CPU regardless — and the overhead of partitioning the graph and marshaling tensors across the CoreML/CPU boundary for those 50 nodes outweighs any compute speedup for a model this small and already this fast. This is a real, known characteristic of accelerator delegation, not a bug: small, quantized, already-fast models are exactly the case where "try the accelerator first" can backfire. The priority order here is deliberately still DSP→GPU→CPU as asked (a fixed, standard delegation chain), not an adaptive "benchmark and pick the fastest" scheme — if raw latency matters more than following that convention, pass `providers=["CPUExecutionProvider"]` directly to skip CoreML.
 
 ## Notes
 

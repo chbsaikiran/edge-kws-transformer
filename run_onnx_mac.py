@@ -28,9 +28,31 @@ import onnxruntime as ort
 import kws_common_torch as kws
 from kws_common_torch import SpeechCommandsDataset, load_wav_as_mel
 
+# Delegation priority: DSP -> GPU -> CPU. Unlike TFLite's Python API (which
+# has no built-in fallback and requires catching a load failure per
+# delegate), ONNX Runtime does this natively: InferenceSession tries
+# `providers` in list order and silently skips any provider that isn't
+# compiled into the installed onnxruntime package, always falling through to
+# CPUExecutionProvider, which ships in every build. Confirmed on this Mac
+# (`ort.get_available_providers()`): CoreMLExecutionProvider (Apple GPU/
+# Neural Engine) and CPUExecutionProvider are present; QNNExecutionProvider
+# (Qualcomm Hexagon DSP) is not, since this hardware doesn't have it -- so
+# here this resolves to CoreML, with CPU as the guaranteed fallback. On a
+# Qualcomm-powered device with the QNN provider installed, the same list
+# would pick that up first instead, no code change needed.
+PROVIDER_PRIORITY = [
+    "QNNExecutionProvider",     # DSP/NPU (Qualcomm Hexagon)
+    "CoreMLExecutionProvider",  # GPU/Neural Engine (Apple Silicon)
+    "CUDAExecutionProvider",    # GPU (NVIDIA, only if onnxruntime-gpu is installed)
+    "CPUExecutionProvider",     # always available -- guaranteed fallback
+]
+
 
 def load_session(onnx_path: str) -> ort.InferenceSession:
-    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    available = set(ort.get_available_providers())
+    providers = [p for p in PROVIDER_PRIORITY if p in available]
+    sess = ort.InferenceSession(onnx_path, providers=providers)
+    print(f"Execution provider: {sess.get_providers()[0]}  (tried, in order: {providers})")
     in_info = sess.get_inputs()[0]
     out_info = sess.get_outputs()[0]
     print(f"Input : {in_info.name} {in_info.shape} {in_info.type}")
