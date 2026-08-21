@@ -1,0 +1,18 @@
+# Mac (training / conversion / verification) for the PyTorch -> ONNX pipeline
+torch
+torchaudio      # only used for MelSpectrogram/FrequencyMasking/TimeMasking transforms;
+                # dataset file I/O deliberately avoids torchaudio.load (see kws_common_torch.py
+                # docstring -- current torchaudio hard-requires TorchCodec + system FFmpeg to
+                # decode anything, which we sidestep with a stdlib `wave` reader instead)
+onnx
+onnxruntime
+onnxscript      # required by torch.onnx.export's exporter as of recent torch releases
+numpy
+tqdm
+
+# Raspberry Pi (inference only) — use run_onnx_pi.py, NOT run_onnx_mac.py.
+# It's a separate, self-contained script (own NumPy mel-spectrogram
+# implementation, verified to match torchaudio's output to float32 precision)
+# with zero torch/torchaudio/onnx dependency -- only:
+#   pip install onnxruntime numpy
+# (official onnxruntime wheels cover linux_aarch64, so this is a light install)

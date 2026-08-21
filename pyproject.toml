@@ -12,3 +12,14 @@ dependencies = [
     # numerically wrong gradients for this model (see train_tf.py's
     # set_visible_devices([], "GPU") comment) -- training is CPU-only for now.
 ]
+
+[project.optional-dependencies]
+# PyTorch -> ONNX pipeline (train.py, convert_to_onnx.py, run_onnx_mac.py).
+# Install with: uv sync --extra torch
+torch = [
+    "torch",
+    "torchaudio",
+    "onnx",
+    "onnxruntime",
+    "onnxscript",
+]
